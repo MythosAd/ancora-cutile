@@ -1,5 +1,84 @@
 # ANCORA — Development Notes
 
+*This document has two parts: a personal **preface** (why the project exists and how I think about it), and a technical **engineering journal** (the bugs, dead ends, and numerics traps). Where they overlap — train/inference consistency especially — the journal has the implementation details.*
+
+---
+
+## Preface — why ANCORA exists, and how I think about it
+
+*Author's notes, in my own words.*
+
+### How it started
+
+I started this because the shared A100 40 GB I had access to at university simply couldn't train my model — ANCORA, a reinforcement-learning project built on Qwen2.5-3B-Coder. RL post-training even a 3B model (rollouts, a full forward and two backward passes, optimizer state, and stored activations) doesn't sit comfortably in 40 GB, and that frustration is what pushed me to start writing my own kernels. I went in knowing a single-laptop-GPU stack might never be more than a toy for practice — and that's roughly how it turned out — but it has already given me the thing I wanted most: an understanding of how all of this works, from the metal up. (The framework in this repo therefore targets the much smaller Qwen3-0.6B — what actually fits, and trains, on a 16 GB laptop GPU.)
+
+### Why cuda-tile
+
+There are several DSLs for writing kernels today: Triton (the most popular right now), TileLang, and cuda-tile. I have no intention of making cross-hardware DSL work my long-term career — I don't have that need — and I do want to chase maximum performance, so I picked NVIDIA's native cuda-tile as my way in. It also keeps a clean path open to drop down into CUTLASS and PTX later, and I'm betting on NVIDIA keeping its dominant position on the training side.
+
+### A word of thanks — and an opinion
+
+Finally, my deep thanks to Anthropic for giving the world a tool like Claude Code. On the politics, I fully share Dario's view: I cannot imagine the horror of a future in which ASI is monopolized by an authoritarian government — it would be a bleak and miserable hell. Too many people today are still trading the future away for small immediate gains, building — without realizing it — the very hell that will one day trap them. A deal with the devil never ends well.
+
+With that said, let's get back to it and begin the vibe-coding journey.
+
+### Reinforcement learning, and the compromises it forces
+
+Right now, reinforcement learning may be the single most important step on the path to ASI. But at this stage it still carries some engineering warts, and a few practical trade-offs you simply have to accept.
+
+**The first compromise is practical: the 3:1 compute ratio.** A model has a forward pass and a backward pass. The forward is essentially `x · W` compute. The backward has to produce two things: the parameter gradient `dL/dW` (used to update the weights) and the data gradient `dL/dx` (the chain-rule intermediate that propagates error to the previous layer). Each of those costs about as much as the forward, so the backward is ≈ 2× the forward, and training is therefore ≈ **3× the compute of inference**: one forward plus two backward passes (one for the data gradient, one for the parameter gradient). The only genuine "corner": the **first layer can skip its data gradient** `dL/dx` — its input is a discrete token-embedding lookup, so there's nothing upstream to hand a gradient to — which puts training a hair under 3:1. The last layer has no symmetric shortcut: the LM head still needs both its weight gradient *and* to seed the backward chain (`dL/dhidden`).
+
+**So why not reuse the training forward as the inference forward, and make it 3:0?** The catch is that the two forwards run in fundamentally different regimes. During training (pretraining and SFT) the whole sequence is already known, so the forward is a **prefill**: every position is processed at once as one large matmul. Prefill is **compute-bound** — each weight is reused across all the tokens in the batch, so the tensor cores stay saturated (high MFU). During rollout you don't have the sequence yet — you're *generating* it. Token *t+1* depends on the model's output at token *t*, so generation is inherently autoregressive: you **decode** one token at a time. Decode is **memory-bandwidth-bound** — to emit a single token you must stream every weight (and the whole KV cache) out of HBM with almost no arithmetic reuse, so the tensor cores starve and MFU collapses; what limits you is HBM read bandwidth, not FLOPs (which is also why the KV cache, discussed below, matters so much). The two forwards compute the same function, but you cannot "save" the training forward and replay it as the rollout, because at generation time the future tokens it would consume don't exist yet. So the two passes stay decoupled — there is no free 3:0.
+
+A natural follow-up: during the rollout, could you store every token's activations and KV cache, then — once the sequence finishes and the environment returns a reward — backprop through all of it? Structurally the *waiting* part is exactly right: RL does hold the whole completion and its reward before computing the policy gradient. But in practice you don't backprop through the activations you saved *during decode*, for two reasons. First, memory: keeping every layer's activations for a long generated sequence is enormous — this is precisely what activation checkpointing exists to tame (see §7). Second, and more subtly, a naive decode forward is numerically a *different* computation from prefill, so the activations saved during rollout would not equal what a training prefill computes for the same tokens — backprop through them would be biased. The standard answer is **recompute**: when the sequence is complete, run one high-MFU prefill forward over it and backprop through *that*. ANCORA's twist is that its decode is made bitwise-identical to prefill, so the rollout logprobs are themselves valid training signal (`ratio = 1`, no importance sampling) — but the backward still rides on a recomputed prefill, because that's where the throughput is.
+
+Once you internalize this, the shape of an RL system becomes clear: it splits into a **training engine** (running prefill) and a **rollout engine** (running decode), and the two are, in all likelihood, different kernels.
+
+### The first real problem: train/inference inconsistency
+
+And that split is exactly where the trouble starts. Floating-point arithmetic on a computer is discrete: every operation rounds to finite precision, and that rounding means floating-point addition is **not associative** — `(A + B) + C ≠ A + (B + C)`.
+
+This breaks train/inference consistency at two levels.
+
+**1. Batch-invariant kernels.** When a kernel processes a batch, if it doesn't split the sequence dimension the same way every time, the reduction order changes. Kernels chasing parallel performance love to do exactly this — split into 128-token chunks when the batch is small, 256 when it's large — and because the split rule differs, the reduction produces a *different* result. That doesn't only desync training from inference; it means *the same sequence gives different numbers at different batch sizes.* The only fix is to write **every** kernel to be batch-invariant.
+
+The kernels in this stack that obey batch invariance, and the rule each follows:
+
+- **GEMM** (`linear.py`) — no split-K: one block owns the entire `K` reduction, accumulated sequentially.
+- **Attention** (`attention.py`) — no split-KV: one block owns the full per-query reduction over the cache, and **decode reuses this exact prefill kernel**.
+- **RMSNorm** (`norm.py`) — each row's reduction stays on a single core (a fixed two-pass), never split across blocks.
+- **RoPE** (`rope.py`) — elementwise, so trivially position- and batch-invariant.
+- **SwiGLU** (`activation.py`) — elementwise.
+- **Fused cross-entropy / loss** (`loss.py`) — the log-softmax reduction stays on one core, in a fixed order.
+
+Tile sizes are compile-time constants everywhere; nothing is ever chosen from the batch size or sequence length, and there is no autotuning that would switch tile shape at runtime. This is verified bitwise: the same input twice gives identical output; batch-size invariance (B=1 vs B=4 agree on the shared row); and — the RL-critical one — sequence-length invariance (the token at position *t* is identical for S=256 vs S=512), which is exactly what makes a rollout logprob equal to what training later assigns. (The full numerics story is in §4.)
+
+**2. Kernel-behavior inconsistency between prefill and decode.** As above, prefill is parallel and decode is serial, so their kernels run different logic. The fix is to make decode go through *the same fixed-size tile the prefill kernel uses*, padding the single decode token up to a full tile. In this codebase that is literal, and the tile size is per-operator (not a uniform 128): the projection **GEMMs** pad the decode token batch up to a full **128-row MMA tile** (`MGEMM = 128`), so the frontier token is computed by exactly the same GEMM arithmetic as a 128-row prefill chunk; **attention** uses **64-row query blocks** (`BQ = BKV = 64`, the gau-nernst 64×64×128 config that hits ~94% SOL), so decode drops the frontier query into the 64-row prefill attention block over the KV cache and reads back that row. Either way the decode arithmetic is bitwise-identical to prefill — which is what makes the rollout logprob equal to what training assigns.
+
+### The optimization problem: architecture
+
+With train/inference consistency handled, the most important remaining problem is optimization — and a lot of that is architecture.
+
+Every modern transformer runs into two choices: **global attention** and **MoE**. Both are decisive for whether a model can drastically cut inference cost and actually be deployed commercially.
+
+**Global attention.** To keep the `O(N²)` cost from blowing up quadratically at decode time, you keep a large pile of intermediate state — the KV cache. Without it, every decode step would recompute the key and value projections for *all* previous tokens — `O(t)` projection work at step *t*, `O(S²)` over the whole sequence. The cache stores them once, so each step only projects the new token's K and V (`O(1)`) and reads the rest, dropping the projection cost from `O(S²)` back to `O(S)`. (The attention score and value-weighting themselves are still `O(t)` per step, i.e. `O(S²)` in total — the cache removes the redundant *recompute*, not attention's inherent quadratic.) The price is memory that grows linearly with sequence length, per layer. And even though GQA or latent attention compress the multi-head KV cache down to a fraction of the query, that still isn't enough to bring the cost down.
+
+So **hybrid attention** has to take the stage. Of all the sub-quadratic ("linear") attention options, the one I'm still most bullish on is **local (sliding-window) attention**: it keeps full attention's simplicity and hardware-friendliness, and its raw dot-product expressiveness is unmatched — which is why I think it has the best shot at leading the future of sub-quadratic attention architectures. (Worth noting: in a hybrid design, *not* applying RoPE to the global-attention layers buys good length extrapolation — so the global layers here are NoPE.)
+
+**MoE.** Most of a modern LLM's parameters live in the FFN. The FFN's job is essentially associative memory — the model queries it for the vast store of world knowledge it holds — plus representation transformation. Mechanically it is a simple `proj-up → activation → proj-down`.
+
+SwiGLU adds a third matrix — a gate: `down( silu(x·W_gate) ⊙ (x·W_up) )`. At a plain FFN's `×4` hidden width that's 1.5× the parameters, so the width is shrunk to keep the budget equal — three matrices at `×8/3` match a two-matrix `×4` FFN's `8·d²` (LLaMA uses `8/3`; Qwen3-0.6B here uses `3×`). The gate is no free parameter saving; it's a data-dependent multiplicative gate that buys expressiveness at equal parameter count.
+
+In the same spirit: querying world knowledge does not require querying the whole library. If you run a softmax router over the FFN "experts" and pick only the best few for each token — like sharding a database — you offload most of the activation parameters. At deployment, expert-parallelism on top of this cuts inference cost dramatically. Today it is routine for a 1T-parameter model to activate only 35–45B parameters per token.
+
+That said, MoE does not eliminate everything: a **shared expert** (a shared FFN) has become a near-mandatory ingredient in every open-source model. My guess is that the necessary per-layer representation transformation is indispensable, and a shared expert provides a parameter-sharing constraint that fits the training dynamics better.
+
+There is a very elegant alternative, though, from Microsoft's MAI model: in their experiments the MoE FFN's shared expert can be dropped entirely and replaced by **interleaving a dense FFN layer**, to the same effect. It is a beautiful design, and it is the one I adopted into this architecture.
+
+---
+
+# The engineering journal
+
 An engineering journal for building a from-scratch RL/SFT training stack in pure Python on `cuda.tile`, targeting a single RTX 5080 Laptop (`sm_120a`). This is the human-readable companion to [`CLAUDE.md`](CLAUDE.md), which is the raw, exhaustive working log. Here I try to distill *what was actually hard*, the traps that cost days, and the few ideas that made the whole thing work.
 
 If you only read one section, read [Batch invariance → `ratio = 1`](#4-batch-invariance--ratio--1-the-one-idea-that-justifies-the-project).
@@ -12,7 +91,7 @@ Modern RL post-training (GRPO/PPO) usually runs as two systems: a fast inference
 
 The bet behind ANCORA: on **one GPU**, in **one codebase**, you can make rollout and training **bitwise-identical** and delete that entire problem. Everything else — the kernels, the device-resident orchestration, the precision choices — is in service of that bet, and of doing it on hardware that costs less than a month of cloud H100 time.
 
-The constraint that shaped everything: **no PyTorch, no CUDA C++.** Just NVIDIA's `cuda.tile` (a Python DSL that emits tensor-core code), `cuda.core`, and `cuda.bindings`. That keeps the stack small and inspectable, but it means every numerical primitive is hand-built and every DSL sharp edge is yours to find.
+The constraint that shaped everything: **almost no PyTorch, almost no CUDA C++.** The numerical core is NVIDIA's `cuda.tile` (a Python DSL that emits tensor-core code), `cuda.core`, and `cuda.bindings`. Two deliberate exceptions: the **MoE router** is a hand-written plain-CUDA kernel (`moe_dispatch.cu`, NVRTC-compiled for `sm_120a`) because cuda-tile can't express its data-dependent dispatch/sort, and there's an **optional, off-by-default CUTLASS** MXFP8 GEMM path (`resident*.py` `cutlass=True`) kept as a performance reference for the projection GEMMs. Everything else is cuda-tile — which keeps the stack small and inspectable, but means every numerical primitive is hand-built and every DSL sharp edge is yours to find.
 
 ---
 
