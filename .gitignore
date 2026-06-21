@@ -1,0 +1,50 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+
+# ---- Claude Code / local agent state ----
+.claude/
+CLAUDE.local.md
+
+# ---- CUDA / build / profiling artifacts ----
+*.cubin
+*.ptx
+*.fatbin
+*.o
+*.obj
+*.exe
+*.lib
+*.exp
+*.ncu-rep
+*.nsys-rep
+*.qdrep
+
+# ---- Local data / weights (kept outside the repo) ----
+# Model weights live at C:\model\Qwen3-0.6B — never vendored here.
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+data/
+checkpoints/
+
+# ---- Editor / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
