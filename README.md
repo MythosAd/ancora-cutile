@@ -104,8 +104,8 @@ A deeper map (every kernel, every layer, every hard-won lesson) lives in [`CLAUD
 If you use ANCORA in your research or build on it, please cite it:
 
 ```bibtex
-@software{ancora2026,
-  author  = {MythosAd},
+@software{yang2026ancora,
+  author  = {Yang, Chengcao},
   title   = {ANCORA: A single-GPU, batch-invariant on-policy RL (GRPO) + SFT
              training framework in pure cuda.tile for RTX 5080 (sm_120a)},
   year    = {2026},
@@ -114,8 +114,6 @@ If you use ANCORA in your research or build on it, please cite it:
               GRPO loop needs no importance sampling.}
 }
 ```
-
-> Replace `author` with your name/handle as you'd like to be cited.
 
 ## Acknowledgements
 
