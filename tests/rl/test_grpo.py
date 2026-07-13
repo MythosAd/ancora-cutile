@@ -38,7 +38,9 @@ def test_advantage_formulas():
     ok &= np.allclose(A3[:4], np.array([1,2,3,4]) - 2.5, atol=1e-3)
     # advantage sums ~0 within a group (centered)
     ok &= abs(A[:4].sum()) < 1e-3
-    print(f"  std/mean/none all match manual, group-centered (Σ≈0): {'OK' if ok else 'FAIL'}")
+    # DEFAULT is the ML form (== norm="mean"): adv = (r-mean)/(|mean|+eps)
+    ok &= np.array_equal(grpo_advantage(rewards, 4), A2)
+    print(f"  std/mean/none match manual, default==ML(mean), group-centered (Σ≈0): {'OK' if ok else 'FAIL'}")
     return ok
 
 

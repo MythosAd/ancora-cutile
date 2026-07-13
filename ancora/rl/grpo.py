@@ -18,14 +18,18 @@ import numpy as np
 # ── advantage (host-side; formula does NOT touch any kernel) ─────────────────
 
 def grpo_advantage(rewards: np.ndarray, group_size: int,
-                   norm: str = "std", eps: float = 1e-4) -> np.ndarray:
+                   norm: str = "mean", eps: float = 1e-4) -> np.ndarray:
     """
     Group-normalised advantage. rewards: (num_groups * group_size,) — G completions
     per prompt, laid out contiguously. Returns per-completion advantage, same shape.
 
     norm:
+      "mean" → (r - mean) / (|mean| + eps)  DEFAULT — maximum-likelihood policy
+               optimizer: advantage = relative improvement over the group mean, so
+               the PG loss ≈ reward-weighted MLE with a mean baseline. |mean| (not
+               mean) keeps the sign correct if rewards can go negative, and eps
+               covers the all-fail group (mean≈0 → centered r is 0 anyway → adv≈0).
       "std"  → (r - mean) / (std + eps)     standard GRPO / DeepSeek
-      "mean" → (r - mean) / (|mean| + eps)  relative-reward variant
       "none" → (r - mean)                   no scaling
     Swap freely — none of this is in the kernel.
     """

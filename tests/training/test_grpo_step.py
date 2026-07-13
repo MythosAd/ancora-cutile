@@ -1,8 +1,8 @@
 """End-to-end GRPO on-policy loop — the project's north star, validated on a toy task:
 "emit the target token". Each iteration:
   rollout (sample G completions/prompt) → reward (fraction == target) → group-relative
-  advantage (rl/grpo.py, DeepSeek (r-mean)/std) → policy-gradient update (model.loss_backward
-  with per-token advantage = linear_ce) → Muon/AdamW.
+  advantage (rl/grpo.py, ML default (r-mean)/(|mean|+eps)) → policy-gradient update
+  (model.loss_backward with per-token advantage = linear_ce) → Muon/AdamW.
 The MEAN REWARD must climb (the GRPO analog of "loss goes down") — proof the RL loop learns.
 
 β=0 (no KL / ref model). Fully on-policy (rollout & update use the same weights → ratio≈1,
@@ -51,7 +51,7 @@ def main():
         model.load(opt.weights())
         ids = generate(model, prompts_rep, GEN, si, temp=1.0, seed=1000 + it)   # rollout
         reward = (ids[:, P:] == TARGET).mean(1).astype(np.float32)              # (B,)
-        A = grpo_advantage(reward, group_size=G, norm="std")                    # group-relative
+        A = grpo_advantage(reward, group_size=G)          # ML default: (r-mean)/(|mean|+eps)
         labels, adv_tok = build_grpo_targets(ids, A, P)
 
         hidden, cache = model.forward(ids, si)

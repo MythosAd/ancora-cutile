@@ -4,7 +4,7 @@ BF16" — in on-policy RL the FP4 model IS the policy; the question is whether i
 QAT-style: BF16 master weights, forward quantizes to NVFP4 (the same forward used for sampling
 AND the policy gradient → batch-invariant by construction), straight-through backward updates the
 master. Task = the framework's "emit target token": N prompts each map to one target token; reward
-1 if a sampled token hits its target. GRPO advantage = (r-mean)/(std+eps) (mirrors rl/grpo.py).
+1 if a sampled token hits its target. Advantage = rl/grpo.py default (ML form (r-mean)/(|mean|+eps)).
 Run BF16 vs NVFP4 and compare the reward curves. NVFP4 GEMM ≡ dequant product (proven 0.166%),
 so the numpy quant→dequant matmul is a faithful proxy."""
 import sys, os
