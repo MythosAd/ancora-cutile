@@ -38,11 +38,12 @@ def timed(fn, n=5):
 ml = m.muon_lr
 t_bproj = timed(lambda: m.batched_proj_muon.step(si, ml))
 t_layers = timed(lambda: [l.step(si, 1e-4, 0.9, 0.999, 1e-8, 0.0, ml) for l in m.layers])
-# isolate the expert NS (MoE layers' moe.step) vs the proj/norm part of the layer step
+# isolate the expert NS (MoE layers' moe.step) vs the norm part of the layer step
 moe_layers = [l for l in m.layers if hasattr(l, "moe")]
 t_experts = timed(lambda: [l.moe.step(si, 1e-4, muon_lr=ml) for l in moe_layers])
+nw = {k: len(ws) for k, ws in m.batched_proj_muon.groups.items()}
 print(f"  M={M} Muon optimizer breakdown (real size NL={cfg.n_layers}):")
-print(f"    batched square proj NS : {t_bproj:6.1f} ms  ({len(m.batched_proj_muon.groups[1024])} weights)")
-print(f"    per-layer step (q/o muon + norms AdamW + expert NS): {t_layers:6.1f} ms")
+print(f"    batched proj NS (ALL 2D: square + rect q/o): {t_bproj:6.1f} ms  groups {nw}")
+print(f"    per-layer step (norms AdamW + expert NS): {t_layers:6.1f} ms")
 print(f"      └ of which MoE expert NS ({len(moe_layers)} layers × 3): {t_experts:6.1f} ms")
-print(f"    ⇒ q/o per-weight muon + norms ≈ {t_layers - t_experts:6.1f} ms")
+print(f"    ⇒ norms AdamW ≈ {t_layers - t_experts:6.1f} ms")

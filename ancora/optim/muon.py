@@ -205,51 +205,82 @@ class ResidentMuon:
 
 
 class BatchedProjMuon:
-    """Model-level BATCHED Muon over SAME-SHAPE square projection weights ACROSS ALL layers — the
-    industrial single-GPU Muon pattern (Keller/Kimi: group by shape, batch the Newton-Schulz). The
-    per-weight NS was launch-overhead-dominated (~195 ms/step proj at NL=12, ~1950 tiny launches);
-    batching the NS over `chunk` weights at a time pushes it toward the GEMM compute floor. SQUARE
-    (K==N) only — k/v/gate/up/down are 1024² in this model, EXACTLY the expert shape → reuses the
-    batched-expert NS (newton_schulz_resident_e) verbatim; q/o (rectangular) stay per-weight (phase
-    1b). The per-weight momentum/update stay single-kernel (cheap) and write to / read from packed `u`
-    slices via at_pos; only the expensive 5-iter NS chain is batched. Operates IN PLACE on the layers'
-    existing buf/p32/p16/G — drop-in for the per-weight ResidentMuon proj step.
+    """Model-level BATCHED Muon over ALL 2D projection weights ACROSS layers — the industrial
+    single-GPU Muon pattern (Keller/Kimi: group by shape, batch the Newton-Schulz). The per-weight
+    NS was launch-overhead-dominated (~195 ms/step proj at NL=12, ~1950 tiny launches); batching the
+    NS over `chunk` weights at a time pushes it toward the GEMM compute floor.
+    Groups by NS SHAPE (M=min(K,N), Nn=max): square k/v/gate/up/down (1024²) form one group and the
+    RECTANGULAR q/o both land in the (1024,2048) group — o (tall, K>N) enters/leaves the packed batch
+    through the fused transpose kernels (_muon_mom_t / _muon_update_cast_t, bit-identical to the
+    per-weight mom+transpose/update+cast pairs, no staging buffer). The per-weight momentum/update
+    stay single-kernel (cheap) and write to / read from packed `u` slices via at_pos; only the
+    expensive 5-iter NS chain is batched. Operates IN PLACE on the layers' existing buf/p32/p16/G —
+    drop-in for the per-weight ResidentMuon proj step.
 
-    weights: list of {buf:(K,N)f32, p32:(K,N)f32 view, p16:(K,N)bf16, G:(K,N)f32, K, N} for square proj."""
-    def __init__(self, weights, momentum=0.95, ns_steps=5, chunk=8):
+    weights: list of {buf:(K,N)f32, p32:(K,N)f32 view, p16:(K,N)bf16, G:(K,N)f32, K, N, lid}.
+    scope: None → one global group per shape (fewest chains); int k → sub-group by lid//k (the
+    pipeline-parallel granularity: each k-layer stage owns and steps its own NS batches)."""
+    def __init__(self, weights, momentum=0.95, ns_steps=5, chunk=8, scope=None):
         from ancora.model.resident import _DBuf
         from ancora.kernels.muon_ns import NTM
         self.mom, self.ns = momentum, ns_steps
-        self.groups = {}                                     # K -> [weight dicts] (all K==N here)
+        self.groups = {}                                     # (M,Nn[,bucket]) -> [weight dicts]
         for w in weights:
-            assert w["K"] == w["N"], f"BatchedProjMuon: square only, got ({w['K']},{w['N']})"
-            assert w["K"] % NTM == 0, f"K={w['K']} not 128-aligned"
-            self.groups.setdefault(w["K"], []).append(w)
-        self.scr = {}                                        # one chunk's packed u + NS scratch per K
-        for K, ws in self.groups.items():
+            K, N = w["K"], w["N"]
+            w["tr"] = K > N                                  # tall → NS runs on the transpose
+            w["M"], w["Nn"] = (N, K) if w["tr"] else (K, N)
+            w["scale"] = max(1.0, K / N) ** 0.5              # Keller's shape-aware lr scale
+            assert w["M"] % NTM == 0 and w["Nn"] % NTM == 0 and K % 64 == 0 and N % 64 == 0, \
+                f"Muon weight ({K},{N}) tile-misaligned"
+            key = (w["M"], w["Nn"]) if scope is None else (w["M"], w["Nn"], w.get("lid", 0) // scope)
+            self.groups.setdefault(key, []).append(w)
+        self.scr = {}                                        # one chunk's packed u + NS scratch per shape
+        shapes = {}                                          # share scratch across buckets of one shape
+        for key, ws in self.groups.items():
+            M, Nn = key[0], key[1]
             c = min(chunk, len(ws))
+            if (M, Nn) in shapes and shapes[(M, Nn)]["c"] >= c:
+                self.scr[key] = shapes[(M, Nn)]              # a bigger chunk's scratch covers this bucket
+                continue
             Z = lambda *s: _DBuf.zeros(s, np.uint16)
-            self.scr[K] = dict(c=c, u=Z(c * K, K), gA=Z(c * K, K), gA2=Z(c * K, K),
-                               gB=Z(c * K, K), gBX=Z(c * K, K), recip=_DBuf.zeros((c, 1), np.float32))
+            s = dict(c=c, M=M, Nn=Nn, u=Z(c * M, Nn), gA=Z(c * M, M), gA2=Z(c * M, M),
+                     gB=Z(c * M, M), gBX=Z(c * M, Nn), recip=_DBuf.zeros((c, 1), np.float32))
+            if (M, Nn) in shapes:                            # grow: replace the smaller shared scratch
+                old = shapes[(M, Nn)]
+                for k2 in list(self.scr):
+                    if self.scr[k2] is old: self.scr[k2] = s
+                for b in (old["u"], old["gA"], old["gA2"], old["gB"], old["gBX"], old["recip"]): b.free()
+            shapes[(M, Nn)] = s
+            self.scr[key] = s
 
     def step(self, si, lr=0.02):
-        from ancora.kernels.muon_ns import _muon_mom, _muon_update, newton_schulz_resident_e, NTM, NTN
-        from ancora.kernels.fused import _cast_bf16, RTM, RTN
-        for K, ws in self.groups.items():
-            s = self.scr[K]; c0 = s["c"]; u = s["u"]
+        from ancora.kernels.muon_ns import (_muon_mom, _muon_mom_t, _muon_update_cast,
+                                             _muon_update_cast_t, newton_schulz_resident_e, NTM, NTN)
+        for key, ws in self.groups.items():
+            s = self.scr[key]; c0, M, Nn = s["c"], s["M"], s["Nn"]; u = s["u"]
             for i0 in range(0, len(ws), c0):                 # chunk the group to cap the NS scratch
                 grp = ws[i0:i0 + c0]; c = len(grp)
                 for i, w in enumerate(grp):                  # momentum+Nesterov → packed u slice i
-                    ct.launch(si, (K // NTM, K // NTN, 1), _muon_mom,
-                              (w["buf"], w["G"], u.at_pos(i * K), float(self.mom), NTM, NTN))
-                newton_schulz_resident_e(u, s["gA"], s["gA2"], s["gB"], s["gBX"], s["recip"], c, K, K, si, self.ns)
+                    if w["tr"]:                              # tall: transposed store into the batch
+                        ct.launch(si, (w["K"] // 64, w["N"] // 64, 1), _muon_mom_t,
+                                  (w["buf"], w["G"], u.at_pos(i * M), float(self.mom), 64))
+                    else:
+                        ct.launch(si, (w["K"] // NTM, w["N"] // NTN, 1), _muon_mom,
+                                  (w["buf"], w["G"], u.at_pos(i * M), float(self.mom), NTM, NTN))
+                newton_schulz_resident_e(u, s["gA"], s["gA2"], s["gB"], s["gBX"], s["recip"], c, M, Nn, si, self.ns)
                 for i, w in enumerate(grp):                  # fp32 master update + bf16 weight refresh
-                    ct.launch(si, (K // NTM, K // NTN, 1), _muon_update,
-                              (w["p32"], u.at_pos(i * K), float(lr), NTM, NTN))
-                    ct.launch(si, (K // RTM, K // RTN, 1), _cast_bf16, (w["p32"], w["p16"]))
+                    if w["tr"]:
+                        ct.launch(si, (w["K"] // 64, w["N"] // 64, 1), _muon_update_cast_t,
+                                  (w["p32"], w["p16"], u.at_pos(i * M), float(lr * w["scale"]), 64))
+                    else:
+                        ct.launch(si, (w["K"] // NTM, w["N"] // NTN, 1), _muon_update_cast,
+                                  (w["p32"], w["p16"], u.at_pos(i * M), float(lr * w["scale"]), NTM, NTN))
 
     def free(self):
+        freed = set()
         for s in self.scr.values():
+            if id(s) in freed: continue
+            freed.add(id(s))
             for b in (s["u"], s["gA"], s["gA2"], s["gB"], s["gBX"], s["recip"]): b.free()
 
 
