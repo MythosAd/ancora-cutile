@@ -37,7 +37,8 @@ from ancora.kernels.norm import (_rmsnorm_stats, _rmsnorm_apply, _rmsnorm_bwd_dx
 from ancora.kernels.loss import (_gemm, _ce_stats, _ce_grad, _ce_stats_b, _ce_grad_b,
                                  GTM, GTN, GTK, CTM, TV)
 from ancora.kernels.fused import (_gemm_nt_f32, _gemm_dW, _gemm_dW_acc, _acc_f32, _cast_bf16,
-                                  _embed_gather, _onehot_set, ACM, ACN, RTM, RTN)
+                                  _embed_gather, _embed_dw_scatter, build_id_groups,
+                                  ACM, ACN, RTM, RTN)
 from ancora.optim.adamw import _adamw, _pick_otm, C as ADAM_C
 
 _DWT = 64    # _gemm_dW output row tile (embed grad (V,H))
@@ -59,7 +60,8 @@ def from_host(host, B, S):
 class ResidentMoEModel:
     def __init__(self, cfg, weights: dict, B: int, S: int, device_route: bool = False,
                  mxfp8: bool = False, fp8_bwd: bool = False, long_context: bool = False,
-                 optimizer: str = "adamw", muon_lr: float = 0.02, batch_proj: bool = True):
+                 optimizer: str = "adamw", muon_lr: float = 0.02, batch_proj: bool = True,
+                 muon_scope=None):
         self.cfg, self.B, self.S, self.V = cfg, B, S, cfg.vocab
         self.device_route = device_route       # MoE router on device (sync-free; rollout must match)
         self.mxfp8 = mxfp8                     # MXFP8 forward GEMMs (proj + experts); bwd stays BF16
@@ -81,7 +83,7 @@ class ResidentMoEModel:
         #    tied embed/LM-head + 1D gains + router → AdamW. ONE proj scratch + ONE expert scratch shared
         #    across all layers (built BEFORE the layers; _build_layer hands them down). Drops the experts'
         #    v buffer (the FFN's optimizer bulk) + the proj v → lowers the long_context VRAM floor. ──
-        self.optimizer, self.muon_lr = optimizer, muon_lr
+        self.optimizer, self.muon_lr, self.muon_scope = optimizer, muon_lr, muon_scope
         self._muon_scratch = self._muon_scratch_e = None
         if optimizer == "muon":
             from ancora.optim.muon import MuonScratch
@@ -111,25 +113,32 @@ class ResidentMoEModel:
         if long_context:
             self._setup_checkpoint()
 
-        # ── BATCHED proj Muon: pull the SAME-SHAPE SQUARE proj weights (k/v/gate/up/down, all 1024²)
-        #    out of each layer's per-weight muon and run ONE batched Newton-Schulz across all layers
-        #    (industrial Keller/Kimi pattern) — kills the per-weight NS launch overhead (~195ms→floor).
-        #    q/o (rectangular) stay per-weight in layer.muon (phase 1b). ──
+        # ── BATCHED proj Muon: pull ALL 2D proj weights out of each layer's per-weight muon and run
+        #    batched Newton-Schulz chains grouped by NS shape across layers (industrial Keller/Kimi
+        #    pattern) — kills the per-weight NS launch overhead (~195ms→floor). Square k/v/gate/up/
+        #    down (1024²) form one group; the RECTANGULAR q/o both batch as (1024,2048) (o transposed
+        #    in/out by the fused _muon_mom_t/_muon_update_cast_t — bit-identical to the per-weight
+        #    path). muon_scope=None → global groups; int k → sub-group by lid//k (pipeline-parallel
+        #    granularity: each k-layer stage steps its own batches). ──
         self.batched_proj_muon = None
         if optimizer == "muon" and batch_proj:
-            sq = []
-            for l in self.layers:
+            allw = []
+            for li, l in enumerate(self.layers):
                 if not hasattr(l, "muon"):
                     continue
-                for n in [n for n in l.muon if l.w[n].shape[0] == l.w[n].shape[1]]:
+                for n in list(l.muon):
                     rm = l.muon.pop(n)                        # remove from per-weight muon …
                     l._proj_ext.add(n)                        # … and tell layer.step() to skip it
                     K, N = l.w[n].shape
-                    sq.append(dict(buf=rm.buf, p32=l.opt[n]["p32"].view((K, N)), p16=l.w[n],
-                                   G=l.G[n], K=K, N=N))
-            if sq:
+                    allw.append(dict(buf=rm.buf, p32=l.opt[n]["p32"].view((K, N)), p16=l.w[n],
+                                     G=l.G[n], K=K, N=N, lid=li))
+            if allw:
                 from ancora.optim.muon import BatchedProjMuon
-                self.batched_proj_muon = BatchedProjMuon(sq)
+                self.batched_proj_muon = BatchedProjMuon(allw, scope=muon_scope)
+                # every proj weight is batched → the per-weight MuonScratch is dead weight; free it
+                if self._muon_scratch is not None and all(not l.muon for l in self.layers
+                                                          if hasattr(l, "muon")):
+                    self._muon_scratch.free(); self._muon_scratch = None
 
         # ── TIED embed = LM head: one (V,H) device param + device AdamW (fp32 master + m,v) ──
         embed = weights["embed"].astype(np.float32)                  # (V,H)
@@ -167,7 +176,9 @@ class ResidentMoEModel:
         self.gin   = Z((M, H), np.float32)
         self.gh    = Z((M, H), np.uint16)
         self.gids  = Z((M, 1), np.int32)
-        self.gohot = Z((self.MC, V), np.uint16)
+        # input-embed dW group layout (host stable-sort of ids, uploaded per micro-batch):
+        # sorted row order + per-unique-id (start, count, id), padded to M with count=0
+        self.gsrt, self.ggst, self.ggcnt, self.ggid = (Z((M, 1), np.int32) for _ in range(4))
         self.glog  = Z((self.MC, V), np.float32)
         self.gglog = Z((self.MC, V), np.uint16)
         self.glp   = Z((M, 1), np.float32)
@@ -254,6 +265,10 @@ class ResidentMoEModel:
         backward builds a per-CHUNK device onehot only where the input-embed dW needs it."""
         self._ids_keep = np.ascontiguousarray(np.asarray(ids).reshape(self.M, 1).astype(np.int32))
         cdrv.cuMemcpyHtoDAsync(self.gids.ptr, self._ids_keep, self.gids.nbytes, si)
+        # input-embed dW group layout for _embed_dw_scatter (stable sort ⇒ deterministic order)
+        self._grp_keep = build_id_groups(self._ids_keep[:, 0])
+        for buf, arr in zip((self.gsrt, self.ggst, self.ggcnt, self.ggid), self._grp_keep):
+            cdrv.cuMemcpyHtoDAsync(buf.ptr, arr, buf.nbytes, si)
 
     def _chunks(self, rows):
         m0 = 0
@@ -296,7 +311,7 @@ class ResidentMoEModel:
         """The ENTIRE backward as pure launches (graph-capturable): head → final-norm bwd (device:
         RNE-cast(dhidden) → dx into gdin, dw 2-pass into gfng — bitwise == the old host
         rmsnorm_backward) → layers backward → input-embed dW + accumulate."""
-        M, H, V = self.M, self.H, self.V; T = _DWT
+        M, H = self.M, self.H
         self._set_gacc(gacc)
         self._bwd_head_dev(si, inv_nrm, gacc)
         ct.launch(si, (M // RTM, H // RTN, 1), _cast_bf16, (self.gdhid, self.gdy))
@@ -310,13 +325,13 @@ class ResidentMoEModel:
             if self.long_context:                              # recompute this layer's forward from its
                 self.layers[i].forward(self.layers[i].gx_in, si)   # PERSISTENT input → repopulates the
             gd = self.layers[i].backward(gd, si)                   # shared scratch (deterministic ⇒ exact)
-        # input-embed dW accumulates DIRECTLY onto the LM-head grad (no giegr buffer/_acc_f32
-        # input-embed dW accumulates DIRECTLY onto the LM-head grad (no giegr buffer/_acc_f32
-        # pass), built from a per-CHUNK device onehot (memset + scatter — bits == host build)
-        for m0, mc in self._chunks(M):
-            cdrv.cuMemsetD8Async(self.gohot.ptr, 0, self.gohot.nbytes, si)
-            ct.launch(si, (mc, 1, 1), _onehot_set, (self.gids.at_pos(m0), self.gohot))
-            ct.launch(si, (V // T, H // _DWN, 1), _gemm_dW_acc, (self.gohot, gd.at_pos(m0), self.gegrad, mc // T, T, _DWN, T))
+        # input-embed dW accumulates DIRECTLY onto the LM-head grad — deterministic sorted-
+        # scatter (2026-07-13): out[id] += Σ f32(gd rows of that id) in stable-sorted order,
+        # ONE launch. Replaces the (MC,V) onehot GEMM (2·M·V·H FLOPs + 311MB gohot for M·H
+        # useful adds — 11.43→0.147 ms at M=2048, 78×; bit-identical to the GEMM at real V,
+        # ≤1e-7 regroup-ulp in the duplicate-heavy worst case; test_embed_dw_scatter.py).
+        ct.launch(si, (M, H // 128), _embed_dw_scatter,
+                  (self.ggcnt, self.ggst, self.ggid, self.gsrt, gd, self.gegrad, 128))
 
     def loss_backward(self, h, labels, si: int, advantage=None, norm=None, accumulate=False):
         """labels (M,). Returns CE. Layer grads land in-layer (device); embed grad in self.gegrad;

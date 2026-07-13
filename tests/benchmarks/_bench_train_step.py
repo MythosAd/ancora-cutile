@@ -3,7 +3,10 @@ at NL=12 / V=151936 / window=512, swept over M = B·S to find the best batch and
 Useful FLOPs = 6·P per token (fwd 2P + dgrad 2P + wgrad 2P) for projections/FFN/boundary-head
 + flash-attention fwd/bwd; the onehot input-gather GEMM and input-embed dW (2·M·V·H each) are
 counted as OVERHEAD (a gather implemented as GEMM), reported separately.
-Fresh process per M (WDDM rule).  Usage: _bench_train_step.py [M]  (no arg → sweep)"""
+Fresh process per M (WDDM rule).  Usage: _bench_train_step.py [M] [accN|acc] [mx] [fp8bwd] [muon]
+(no arg → sweep incl. the accumulation ladder acc2/4/8 at the best batch M=2048 — accumulation
+amortizes the fixed AdamW BW-sweep: MFU(N) = MFU_fb · t_fb·N/(t_fb·N + t_adamw), asymptote = the
+fwd+bwd MFU itself)."""
 import sys, os, time, subprocess
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -11,7 +14,8 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if len(sys.argv) < 2:
     for m in (512, 1024, 2048, 4096):
         subprocess.run([sys.executable, __file__, str(m)])
-    subprocess.run([sys.executable, __file__, "2048", "acc"])   # 2× M=2048 grad-accum = 4096 tok/step
+    for acc in ("acc2", "acc4", "acc8"):    # accumulation MFU ladder @ best batch (4096-16384 tok/step)
+        subprocess.run([sys.executable, __file__, "2048", acc])
     sys.exit(0)
 
 import numpy as np
@@ -28,7 +32,8 @@ so = dev.create_stream(); si = int(so.__cuda_stream__()[1])
 def sync(): cudart.cudaStreamSynchronize(si)
 
 M = int(sys.argv[1]); B, S = 1, M
-ACC = "acc" in sys.argv[2:]                          # 2 accumulated micro-batches per step
+_acc = next((a for a in sys.argv[2:] if a.startswith("acc")), None)
+NACC = (int(_acc[3:]) if len(_acc) > 3 else 2) if _acc else 1   # accumulated micro-batches per step
 MX = "mx" in sys.argv[2:]                            # MXFP8 forward GEMMs
 FP8B = "fp8bwd" in sys.argv[2:]                      # FP8 E4M3 data-gradient (dgrad)
 MUON = "muon" in sys.argv[2:]                        # Muon/AdamW hybrid (proj+experts → Muon NS)
@@ -50,18 +55,16 @@ ids = rng.integers(0, V, size=(B, S)).astype(np.int64)
 labels = rng.integers(0, V, size=(M,)).astype(np.int64)
 
 def one_step():
+    fs = bs = 0.0
     t0 = time.perf_counter()
-    train.forward(ids, si)
-    t1 = time.perf_counter()
-    train.loss_backward(None, labels, si, norm=(2 * M if ACC else None))
-    t2 = time.perf_counter()
-    if ACC:                                          # second micro-batch: grads ADD in place
+    for i in range(NACC):                            # micro-batch i>0: grads ADD in place
         train.forward(ids, si)
-        train.loss_backward(None, labels, si, norm=2 * M, accumulate=True)
-        t2 = time.perf_counter()
+        t1 = time.perf_counter(); fs += t1 - t0
+        train.loss_backward(None, labels, si,
+                            norm=(NACC * M if NACC > 1 else None), accumulate=(i > 0))
+        t0 = time.perf_counter(); bs += t0 - t1
     train.step(si, lr=1e-4); sync()
-    t3 = time.perf_counter()
-    return t1 - t0, t2 - t1, t3 - t2
+    return fs, bs, time.perf_counter() - t0
 
 try:
     one_step(); one_step()                       # warm (JIT + lazy buffers)
@@ -84,12 +87,13 @@ ctx_g, ctx_l = (S + 1) / 2, min((S + 1) / 2, W)
 attn = 3.5 * 4 * M * Hq * Dh * (n_glob * ctx_g + n_loc * ctx_l)   # fwd + 2.5x bwd
 head = 6 * M * V * H                                     # logits fwd + dhidden + head dW
 useful = proj + attn + head
-overhead = 4 * M * V * H                                 # onehot gather GEMM + input-embed dW
-if ACC:
-    useful, overhead = 2 * useful, 2 * overhead          # two micro-batches per step
+overhead = 0                                             # onehot gather GEMM → _embed_gather (2026-06-12)
+                                                         # + input-embed dW → _embed_dw_scatter (2026-07-13):
+                                                         # both former 2·M·V·H GEMMs are gone
+useful, overhead = NACC * useful, NACC * overhead        # N micro-batches per optimizer step
 free, total = cudart.cudaMemGetInfo()[1:]
-toks = (2 * M if ACC else M)
-tag = (f"M={M}x2acc" if ACC else f"M={M:5d}") + (" MX" if MX else "") + (" FP8bwd" if FP8B else "") + (" muon" if MUON else "")
+toks = NACC * M
+tag = (f"M={M}x{NACC}acc" if NACC > 1 else f"M={M:5d}") + (" MX" if MX else "") + (" FP8bwd" if FP8B else "") + (" muon" if MUON else "")
 print(f"  {tag}: step {tot*1e3:7.1f} ms (fwd {fs*1e3:6.1f} | bwd {bs*1e3:6.1f} | adamw {ss*1e3:5.1f})"
       f"  useful {useful/tot/1e12:5.1f} TF = MFU {useful/tot/80e12*100:4.1f}%"
       f"  (+gather-GEMM ovh {overhead/tot/1e12:4.1f} TF)"

@@ -10,6 +10,7 @@ seams between kernels must stay on-device:
   • _cast_bf16  — f32 → BF16 bits (for the attention f32 output → o_proj seam).
 """
 import sys, os
+import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import cuda.tile as ct
 import ancora.env  # noqa: F401
@@ -381,6 +382,46 @@ def _onehot_set(ids, oh):
     r = ct.bid(0)
     c = ct.reshape(ct.load(ids, index=(r, 0), shape=(1, 1)), ())
     ct.store(oh, index=(r, c), tile=ct.full((1, 1), 0x3F80, ct.uint16))
+
+
+@ct.kernel
+def _embed_dw_scatter(cnt, start, gid, srt, dy, out, THs: ct.Constant[int]):
+    """Input-embed dW WITHOUT the (MC,V) onehot GEMM:
+        out[gid[g]] += Σ_r f32(bf16 dy[srt[start[g]+r]])   (r = 0..cnt[g]-1, sorted order)
+    The onehot GEMM spends 2·M·V·H FLOPs (+ a 311MB gohot buffer) to add M rows into V slots
+    — the useful work is only M·H adds. Host stable-sorts the ids into groups (one group per
+    unique id, rows in original order); ONE block per (group, H-chunk) ⇒ single writer per
+    output row (no atomics) and a FIXED summation order ⇒ deterministic. Same value set as
+    the onehot GEMM, different f32 association ⇒ regroup-ulp vs the old path (grads only —
+    the forward is untouched). Grid (Mpad, H//THs); padding groups have cnt=0 → the runtime
+    guard retires the block (probed real-branch). Data-dependent loop bound = the probed
+    moe._ggemm_dw pattern."""
+    g, hb = ct.bid(0), ct.bid(1)
+    n = ct.reshape(ct.load(cnt, index=(g, 0), shape=(1, 1)), ())
+    if n > 0:
+        st  = ct.reshape(ct.load(start, index=(g, 0), shape=(1, 1)), ())
+        row = ct.reshape(ct.load(gid,   index=(g, 0), shape=(1, 1)), ())
+        acc = ct.zeros((1, THs), ct.float32)
+        for r in range(n):
+            sr = ct.reshape(ct.load(srt, index=(st + r, 0), shape=(1, 1)), ())
+            acc = acc + ct.astype(ct.bitcast(ct.load(dy, index=(sr, hb), shape=(1, THs)), ct.bfloat16), ct.float32)
+        ct.store(out, index=(row, hb), tile=ct.load(out, index=(row, hb), shape=(1, THs)) + acc)
+
+
+def build_id_groups(ids_flat: np.ndarray):
+    """Host side of _embed_dw_scatter: stable-sort token ids into groups. Returns
+    (srt, start, cnt, gid) each (M,1) int32, group arrays zero-padded to M (cnt=0 ⇒ no-op
+    block). Stable sort ⇒ within-group rows keep original order ⇒ deterministic sum."""
+    M = ids_flat.size
+    srt = np.argsort(ids_flat, kind="stable").astype(np.int32)
+    sids = ids_flat[srt]
+    starts = np.concatenate(([0], np.nonzero(np.diff(sids))[0] + 1)).astype(np.int32)
+    counts = np.diff(np.concatenate((starts, [M]))).astype(np.int32)
+    U = starts.size
+    st_p = np.zeros((M, 1), np.int32); st_p[:U, 0] = starts
+    cn_p = np.zeros((M, 1), np.int32); cn_p[:U, 0] = counts
+    gi_p = np.zeros((M, 1), np.int32); gi_p[:U, 0] = sids[starts]
+    return srt.reshape(M, 1).copy(), st_p, cn_p, gi_p
 
 
 @ct.kernel
