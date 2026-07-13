@@ -27,7 +27,8 @@ This is achieved by enforcing **batch invariance** in every kernel — fixed til
 - **Precision:** BF16 forward + FP32 accumulate by default; opt-in **MXFP8** forward (block-scaled `mma_scaled`) and **FP8 (E4M3) dgrad**; FP32 residual stream + stochastic-rounded gradient downcast.
 - **Prefix-shared GRPO** (Prefix Grouper / DualKV): the prompt KV is encoded **once** and all G completions cross-attend it; backward sums the prefix gradient across the group in fixed order.
 - **Long-context training** via activation checkpointing (recompute is deterministic → bitwise-identical grads): single-sequence SFT to ~24K tokens, prefix-GRPO to 16K, on 16 GB.
-- **MFU work:** the GEMM/attention kernels are pushed to the cuda-tile ceiling, then a training "megakernel" pass (device onehot, chunked vocab boundary, ncu-guided retiling, gradient accumulation) lifts training MFU from ~5% to **~35%** at the best batch.
+- **MFU work:** the GEMM/attention kernels are pushed to the cuda-tile ceiling, then a training "megakernel" pass (device onehot, chunked vocab boundary, ncu-guided retiling, gradient accumulation) plus a deterministic **sorted-scatter embedding gradient** (replacing a 160×-wasteful one-hot GEMM) lift training MFU from ~5% to **~45%** at the best batch. Every rejected optimization (CUTLASS hybrid, inline-RoPE fusion, persistent heterogeneous megakernel, FP8 backward) is measured and documented, not assumed.
+- **GRPO advantage** defaults to the maximum-likelihood form `(r − mean)/(|mean| + eps)` (the DeepSeek `std` form stays selectable); the advantage is host-side and fully decoupled from the kernels.
 
 All performance numbers are measured on the one target GPU below; treat them as a journey log, not a spec.
 
@@ -37,7 +38,7 @@ All performance numbers are measured on the one target GPU below; treat them as 
 
 - **GPU:** NVIDIA RTX 5080 Laptop or another `sm_120` / `sm_120a` device (Blackwell consumer). The kernels are compiled `--gpu-architecture=sm_120a`; other architectures are not supported and several kernels rely on `sm_120`-specific facts (e.g. `mma_scaled` block scaling, no WGMMA/tcgen05).
 - **CUDA Toolkit 13.3.** `ancora/env.py` hard-codes the Windows toolkit path and must be imported **before** any `cuda.*` module.
-- **Python** with `numpy`, `cuda.tile` (1.4.0), `cuda.core` (1.0.1+), `cuda.bindings` (13.3.1), and `ml_dtypes` (for `bfloat16` numpy dtype).
+- **Python** with `numpy`, `cuda.tile` (developed on 1.4.0, re-validated bitwise on **1.5.0** — the full `ratio = 1` regression passes unchanged), `cuda.core` (1.0.1+), `cuda.bindings` (13.3.1), and `ml_dtypes` (for `bfloat16` numpy dtype).
 - **OS:** developed and tested on **Windows 11**. Some helpers (offline `nvcc` compile, DLL bootstrap, NVRTC workarounds) are Windows-specific.
 - **Model weights** (real Qwen3-0.6B) are loaded from a local path and are **not** included in this repo.
 
@@ -61,9 +62,9 @@ The most useful entry points are the end-to-end tests under `tests/training/` an
 ## Status / results
 
 - **SFT:** single-layer and full-model cross-entropy collapse to ~0; real Qwen3-0.6B overfit verified.
-- **GRPO:** on-policy loop closed — mean reward `0.002 → 0.93` on a toy task; rollout logprob bitwise-equal to what training assigns.
+- **GRPO:** on-policy loop closed — mean reward `0.005 → 0.96` in 16 iterations on a toy task (ML advantage); rollout logprob bitwise-equal to what training assigns.
 - **Determinism:** forward is bitwise-deterministic across runs; batch-size and sequence-length invariance verified (`max|Δ| = 0`).
-- **Throughput (target GPU):** training ~12–15k tok/s at the best batch (MFU ~35% with gradient accumulation); decode megakernel ~9k tok/s at Bp=64.
+- **Throughput (target GPU, MoE family @ M=2048):** training step 139.8 ms = 14.6k tok/s (**MFU 35.4%**); with 8× gradient accumulation **MFU 45.1% / 18.7k tok/s** (asymptote ≈46% — the honest cuda-tile ceiling for this card; the remaining walls are the consumer BF16 throttle, the optimizer's bandwidth sweep, and a measured-but-unreachable-in-DSL 31% operator-overlap window that would need hand-written CUDA). Decode megakernel ~9.4k tok/s at Bp=64.
 
 ---
 

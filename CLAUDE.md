@@ -34,6 +34,61 @@ Paper: ANCORA. Package: `ancora/`. (Design + precision recipe are consolidated i
 - `cuda.tile` float6 types → do not exist in 1.4.0; FP6 needs inline PTX only
 - `cc.LaunchConfig(cluster_dim=...)` → not exposed in cuda.core
 
+### Toolchain update (2026-07-13): cuda-tile 1.4.0 → 1.5.0 — MAJOR API EXPANSION, walls re-tested
+Probed (tests/kernels/_probe_ct150.py) + full bitwise regression (test_batch_invariant 3/3,
+test_resident_moe_decode ALL Δ=0) → **ratio=1 intact under 1.5.0, zero code changes needed.**
+- ✅ **`ct.cat` + `ct.extract`** (tile concat/slice) — **rotate_half in registers is BITWISE-exact**
+  → the 1.4.0 "no tile slice/concat" wall that blocked RoPE-in-epilogue fusion is DOWN.
+  Adopting it CHANGES forward bits (FMA regrouping) — both paths shift together so ratio=1
+  survives, but every bitwise trace must be re-validated on adoption.
+- ✅ **pitfall-0c (two-loop reload silent miscompile) FIXED** at the RMSNorm repro shape (8/8
+  chunks bitwise == split kernels). Keep the production two-kernel splits anyway (original
+  trigger was subtler than the repro), but new kernels may use reduce-then-reload.
+- ✅ **`ct.gather`/`ct.scatter`/`load_advanced_indexing`(+`Slice`)** — data-dependent addressing
+  in-DSL; embed-gather pattern probed BITWISE. Candidates: KV append, decode pick, MoE token
+  gather (the raw-CUDA router's dispatch/layout could partially return to the DSL).
+- ✅ **`ct.atomic_add/cas/...` + `ct.num_blocks` + MemoryOrder ACQUIRE/RELEASE (+ DEVICE scope
+  on load/store)** — work-ticket probe PASS (60 unique tickets). A PERSISTENT work-queue
+  kernel is now expressible → reopens the "megakernel can't be expressed in cuda-tile"
+  verdict for order-independent work (GEMM output tiles: one block owns full K ⇒ scheduling
+  order doesn't touch bits). Float atomics stay banned (batch invariance).
+- Also new: `argmax/argmin/cumsum/scan/reduce(custom-op)`, `PaddingMode` on load (NEG_INF —
+  attention edges), `RoundingMode` on div/sqrt/exp, `matmul` (3D/batched, fp8-capable),
+  in-kernel `ct.print/printf` (debugging!), `compiler_timeout`, `static_iter`, `ListAnnotation`
+  (list-valued kernel PARAMS), `arange/ones/permute/broadcast_to/expand_dims`.
+- ❌ STILL absent: Python list-of-tiles inside kernels (TileSyntaxError, unchanged);
+  `num_worker_warps` still only (4,8) — no warp specialization ⇒ the ~40%-of-raw-peak simple-
+  loop GEMM ceiling and the CUTLASS verdicts still stand until re-measured.
+- **ADOPTION PROBES (2026-07-13):** (1) inline-RoPE attention (cat/extract,
+  _probe_rope_fused_attn.py): rotation-in-registers is **BITWISE == the rope+attn chain**
+  (0/4.2M diffs — FMA contraction matched), **but SLOWER at every granularity**: full fusion
+  0.45× (K re-rotated per q-block + kv-loop register pressure — the ping-pong lesson again),
+  even Q-only pre-loop rotation 0.92× (register cost > the ~16µs kernel it deletes) ⇒ the
+  2026-06-02 verdict STANDS under 1.5.0; **RoPE stays a separate kernel.** cat/extract remain
+  viable for PRODUCER-side epilogues (qk-norm→rope fusion would save only ~38µs/layer fwd
+  ≈0.2% of a training step — not worth churn). (2) persistent work-queue GEMM
+  (_probe_persistent_gemm.py, fixed 120-block grid): static-stride AND atomic-ticket
+  schedulers both **BITWISE == grid-per-tile** at 2048³/2048·1024²/512·1024² — the
+  megakernel-seed pattern is PROVEN in-DSL. Cost: static ~4% (≈free, deterministic),
+  atomic 13-23% (ticket serialization) ⇒ prefer STATIC assignment for uniform work; the
+  real payoff is multi-op single-launch batching of per-tile-INDEPENDENT work (no grid
+  barrier in the DSL — dependent phases still need separate launches / CUDA graphs).
+  (3) gather/scatter cleanup (_probe_gather_ops.py): tile-batched ct.gather embed-gather
+  and ct.scatter onehot are **BITWISE == production** (_embed_gather/_onehot_set) but perf
+  is a WASH (0.84-1.06×, ~10µs launch-bound kernels) ⇒ production keeps its proven kernels;
+  use gather/scatter for NEW kernels (simpler), don't churn the ratio=1 path.
+  (4) **HETEROGENEOUS persistent batch — the megakernel premise DIRECTLY MEASURED and
+  KILLED in-DSL** (_probe_hetero_persistent.py, GEMM 2048³ 250µs compute-bound + f32 triad
+  112µs BW-bound, independent): overlap window = 31% (seq 361 → ideal max() 250µs), but
+  (b) ONE persistent launch with both op bodies INTERLEAVED = **0.25× (1434µs!)** and even
+  (c) SEGREGATED order = 0.29× — the mere presence of a SECOND tile-body type in the work
+  loop destroys the GEMM's load pipeline (single-op persistent was only 4% — the loop isn't
+  the problem, heterogeneity is); (d) two streams = 0.91× (SM saturation + WDDM queue, the
+  old ~10%-overlap finding, now negative). All bitwise-OK. ⇒ **block-level bubble-fill is
+  NOT reachable in cuda-tile 1.5.0**; the megakernel genuinely requires hand-written CUDA
+  (HazyResearch-style explicit SMEM paging + warp roles). Strongest evidence yet — direct
+  measurement, not the num_worker_warps-no-op inference.
+
 ### Toolchain update (2026-06-01): cuda.core 1.0.1 + bindings 13.3.1 (cuda-tile still 1.4.0)
 cuda.core graduated from `experimental` to stable `cuda.core`. NEW + relevant:
 - **CUDA graphs capture ct.launch** ✓ (TESTED, _probe_cuda_graph.py): `gb=dev.create_graph_builder();
@@ -754,6 +809,30 @@ ancora/
 │   │                   #   unchanged) — the M≤2048 projection GEMMs were 64-block/SM-47% underfilled.
 │   │                   #   Remaining @M=2048: bwd 96ms (layers, fat GEMMs) + AdamW ~32ms floor (551M params
 │   │                   #   ×3 fp32 states ≈ 15GB sweep, BW-bound — the 16GB card's tax) + fwd 17ms.
+│   │                   #   ✅ INPUT-EMBED dW = DETERMINISTIC SORTED SCATTER (2026-07-13) — the bwd's last
+│   │                   #   structural fat: the per-chunk (MC,V) onehot GEMM spent 2·M·V·H FLOPs (0.64 TF)
+│   │                   #   + ~3GB traffic + a 311MB gohot buffer to do M·H adds (4 GF — 160× waste). New
+│   │                   #   fused._embed_dw_scatter + build_id_groups: host stable-sorts ids into groups,
+│   │                   #   ONE block per (group, H-chunk), fixed order (no atomics, data-dep loop bound =
+│   │                   #   the moe._ggemm_dw pattern) ⇒ deterministic; fwd UNTOUCHED ⇒ ratio=1 untouched.
+│   │                   #   11.43→0.147ms at M=2048 (78×); BIT-IDENTICAL to the onehot GEMM at real V
+│   │                   #   (≤1e-7 regroup-ulp worst case V=64); repeat-det Δ=0 (test_embed_dw_scatter.py).
+│   │                   #   DOUBLE WIN: bwd 96.7→82.5ms AND AdamW 49.3→40.4ms (the freed 311MB eased WDDM
+│   │                   #   paging). Step 161.9→139.8ms (MFU 30.6→35.4%, +16% tok/s); acc8 991→876ms (MFU
+│   │                   #   39.9→45.1%, 18697 tok/s). Regressions: test_grad_accum numbers UNCHANGED, prefix
+│   │                   #   model ALL bitwise incl. graph-replay embedG Δ=0. (resident_model.py OLD dense
+│   │                   #   family keeps its onehot path — untouched.)
+│   │                   #   ✅ AdamW SWEEP AUDITED CLOSED (2026-07-13, _probe_adamw_bw.py): the production
+│   │                   #   _adamw kernel ALONE runs 601 GB/s = 67% peak (the practical wall for a 5-array
+│   │                   #   interleaved elementwise sweep) — every re-tile is equal/worse (OTM 64: 608; OTM
+│   │                   #   256: 397; widths 256-1024 all worse; occupancy=2 no help) → NO kernel win exists.
+│   │                   #   Kernel floor for the 16.5GB step-sweep ≈27.5ms; measured in-model 47.6ms — the
+│   │                   #   ~20ms gap is CONTEXT (WDDM pressure ~15GB resident + ~130 launches ≈0.7ms), not
+│   │                   #   kernel. Levers: accum (done, AdamW→18%@2×), resident-byte cuts. CONSIDERED+
+│   │                   #   REJECTED: bf16 m/v states (−27% traffic −4.4GB resident but breaks the AdamW
+│   │                   #   baseline numerics the user wants trustworthy); overlap AdamW-of-layer-i with
+│   │                   #   bwd-of-layer-(i−1) on a 2nd stream (with accum AdamW is 18% of the step → ≤5%
+│   │                   #   end-to-end for real cross-stream-race risk — this project's #1 bug family).
 │   │                   #   ✅ GRADIENT ACCUMULATION (2026-06-12): loss_backward(accumulate=True) → micro-
 │   │                   #   batch ≥1 ADDS weight grads IN PLACE (no accum buffers — they'd cost ~2.2GB and
 │   │                   #   re-page): _gemm_dW_acc / _rmsnorm_dw_reduce_acc / _ggemm_dw_acc on the flag;
@@ -764,10 +843,26 @@ ancora/
 │   │                   #   the M>MC multi-chunk dW accumulation): lp BITWISE Δ=0 (batch invariance), grads
 │   │                   #   ≤1.6e-06 (M-reduction regroup ulp), repeat-det Δ=0, post-AdamW weights 100.00%
 │   │                   #   bit-identical. NB micro-batches are SEPARATE SEQUENCES (B-dim) — per-seq ctx ≤2048.
-│   │                   #   ⚡ ACCUMULATION IS A *TRAINING-MFU* LEVER: it amortizes the ~60ms AdamW BW-floor
-│   │                   #   over more compute (1×M2048 AdamW=33% of step → 2× =18% → MFU 24.5%→29.5% sustained,
-│   │                   #   asymptote ~35% as AdamW→0). So accumulate as many micro-batches as the effective
-│   │                   #   batch needs — strictly better MFU.
+│   │                   #   ⚡ ACCUMULATION IS A *TRAINING-MFU* LEVER: it amortizes the fixed AdamW BW-sweep
+│   │                   #   (~48ms, kernel itself at the 601GB/s=67%-peak elementwise wall — see AdamW audit
+│   │                   #   below) over more compute. MEASURED LADDER @M=2048 (2026-07-13, _bench_train_step
+│   │                   #   accN, fresh proc each): N=1 161.9ms MFU 30.6% 12652 tok/s → N=2 290.1 / 34.1% /
+│   │                   #   14119 → N=4 519.7 / 38.1% / 15764 → N=8 991.4 / 39.9% / 16526. VRAM FLAT 15.9GB
+│   │                   #   (in-place accum adds no buffers). Matches MFU(N)=MFU_fb·t_fb·N/(t_fb·N+48ms)
+│   │                   #   minus ~+5ms/micro-batch accum tax (the _acc dW kernels READ+add the existing grad
+│   │                   #   = +2.2GB/micro) → true asymptote ~41%, not the naive 43%. ⚡ SUPERSEDED by the
+│   │                   #   sorted-scatter embed-dW (below): NEW LADDER N=1 139.8ms/35.4%/14649 → N=2 244.6/
+│   │                   #   40.4%/16748 → N=4 455.1/43.5%/18000 → N=8 876.3/45.1%/18697 (asymptote ~46%).
+│   │                   #   So accumulate as many
+│   │                   #   micro-batches as the effective batch needs — strictly better MFU. ⚠ Beyond ~41%
+│   │                   #   is NOT a CUTLASS/GEMM-swap problem (2026-07-13 re-audit vs [[gemm-mfu-ceiling]]):
+│   │                   #   the BF16 wall is the consumer 1/4-rate throttle at 80TF and our GEMMs already sit
+│   │                   #   at 61-84% of it ("BF16 has ~no headroom"); the CUTLASS hybrid was BUILT+WIRED twice
+│   │                   #   (MXFP8: isolation 1.2-1.4× but end-to-end 1.02×/decode 2.6× SLOWER — un-fusing +
+│   │                   #   scale-scatter + ctypes tax, tests/{hardware,model}/test_cutlass*.py, ratio=1-proven,
+│   │                   #   parked). The only big hand-written prize left is the PERSISTENT megakernel (warp-
+│   │                   #   level overlap of memory-bound other/attention under the throttled GEMMs, ~44%→~60%
+│   │                   #   of BF16 peak plausible) — a separate major project, not a GEMM library call.
 │   │                   #   ✅ MXFP8 PORTED TO THE MoE FAMILY (2026-06-12) — VALIDATED BUT PARKED (default
 │   │                   #   mxfp8=False), the CUTLASS-hybrid verdict again: ResidentMoEModel/PrefixMoEModel/
 │   │                   #   DecodeModel all take mxfp8=True; new moe._ggemm_mx/_ggemm_gus_mx (grouped
@@ -895,9 +990,42 @@ ancora/
 │   │                   #   q/o only. fwd bitwise under PE → ratio=1 untouched. test_polar_express_muon.py +
 │   │                   #   _probe_polar_express{,_device}.py; 3 Muon regression tests still pass. ⚠ Gram NS
 │   │                   #   SKIPPED (FLOP: α≤2 ⇒ 1.47× slower on our square experts; needs α≥4). [[muon-hybrid]]
+│   │                   #   ✅ ALL-2D BATCHED NS + FUSED/TRI CHAIN (2026-07-08): (1) BatchedProjMuon
+│   │                   #   generalized to group by NS SHAPE — square k/v/g/u/d (1024²) AND rect q/o
+│   │                   #   ((1024,2048); tall o enters/leaves the packed batch via _muon_mom_t /
+│   │                   #   _muon_update_cast_t, BIT-identical to mom+transpose / update+cast, no
+│   │                   #   staging); newton_schulz_resident_e was already rect-capable (docstring was
+│   │                   #   square-only). muon_scope=None(global)|int k(per-k-layer buckets — the
+│   │                   #   pipeline-parallel granularity): scope=1 BITWISE == global (grouping only
+│   │                   #   changes the launch grid E), costs +20% proj-NS / +5% step (E small →
+│   │                   #   underfill) — pipeline per-layer stepping is essentially free. (2) NS chain
+│   │                   #   fused=True default: axpys ride the GEMM epilogues (_gemm_axpy_bf16/_e_,
+│   │                   #   5→3 launches/iter, A²/BX never round-trip HBM, X ping-pongs gX↔gBX + copy
+│   │                   #   home on odd steps) = 1.11×; (3) TRI/symmetric GEMMs: A=X@Xᵀ and B=b·A+c·A@A
+│   │                   #   are SYMMETRIC → _gemm_nt_tril/_gemm_axpy_tril(+_e_) compute lower-triangle
+│   │                   #   blocks only (runtime `if n<=m` on bid = REAL branch, probed — idle blocks
+│   │                   #   retire) + 17µs _mirror pass; mirror is BIT-identical (IEEE mult commutes,
+│   │                   #   same k-order; 0 bit-diffs probed). ⚠ in-GEMM transpose(acc) store was 25×
+│   │                   #   slower than the separate mirror (mma-fragment layout scatters — NEVER store
+│   │                   #   a transposed acc). Net chain: square E=16 8.34→5.6ms (1.49×), rect E=24
+│   │                   #   22.2→15.7ms (1.42×); E=1 per-weight neutral (launch-bound — batching is what
+│   │                   #   unlocks tri). REAL-SIZE step M=2048 NL=12: muon opt-step 226→159.5ms (proj NS
+│   │                   #   34.3 + expert NS 118.3 + embed AdamW ~6); full train step 273.5ms vs adamw
+│   │                   #   159.2ms. ⚠ MUON CANNOT BEAT ADAMW PER-STEP (user Q): AdamW = 0-FLOP BW sweep
+│   │                   #   (47.6ms); Muon adds ~11.9 TFLOP of NS GEMM ≈ 112ms at the ~60TF cuda-tile
+│   │                   #   ceiling — the gap IS the NS FLOPs (now 3.3×, was 4.8×); Muon's win stays
+│   │                   #   token-efficiency (~2× fewer steps ⇒ net wall win) + VRAM (no v), and accum
+│   │                   #   amortizes the opt-step. Probes _probe_ns_fused/_probe_ns_tri{,2,3}.py, bench
+│   │                   #   _bench_ns_fused/_bench_muon_vs_adamw/_bench_muon_fullstep.py; ALL 5 Muon
+│   │                   #   regression tests re-pass (equivalence rel 0.00%, scope bitwise). [[muon-hybrid]]
 │   └── hybrid.py       # Muon(2D matrices) + AdamW(1D gains/embed/head) router  ✓
 ├── rl/
-│   ├── grpo.py         # advantage (group (r-mean)/std) + KL (k3, decoupled β=0) + grpo_loss  ✓
+│   ├── grpo.py         # advantage + KL (k3, decoupled β=0) + grpo_loss ✓. DEFAULT advantage is the
+│   │                   #   ML form (2026-07-13, user): adv=(r-mean)/(|mean|+eps) (norm="mean"; PG loss ≈
+│   │                   #   reward-weighted MLE w/ mean baseline). |mean| not mean → sign-safe for negative
+│   │                   #   rewards; eps covers the all-fail group. "std" (DeepSeek GRPO) stays selectable.
+│   │                   #   Host-side formula → NO kernel touched. North-star loop converges FASTER under
+│   │                   #   ML (reward 0.005→0.958/16 it vs 0.93 under std); FP4-convergence + unit tests pass.
 │   ├── rollout.py      # generate (O(S²)) + generate_cached (KV-cache decode, validated 1.2% vs prefill) ✓
 │   ├── prefix_grpo.py  # PREFIX-SHARED training step (Prefix Grouper): prompt encoded ONCE, G completions
 │   │                   #   attend it via _attn_fwd_prefix (+ offset RoPE at pos Sp.., RNE bf16!). fwd: completion
